@@ -1,1 +1,1247 @@
+import os
+import time
+import numpy as np
+import rasterio
+from rasterio.windows import Window, from_bounds
+from rasterio.warp import transform_bounds
+from rasterio.enums import Resampling
+from rasterio.features import rasterize
+import geopandas as gpd
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
+
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import (
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    classification_report,
+    f1_score,
+    balanced_accuracy_score,
+    recall_score,
+    accuracy_score,
+    precision_score,
+)
+
+
+from libpysal.weights import KNN
+from esda.moran import Moran
+import pandas as pd
+
+kwa_path  = r"C:\Users\souvi\Downloads\KeyWildlifeAreas_Solar_GT_20210907\KeyWildlifeAreas_Solar_GT_20210907.tif"
+cdls_path = r"C:\Users\souvi\Downloads\2024_30m_cdls\2024_30m_cdls.tif"
+hab_shp   = r"C:\Users\souvi\Downloads\crithab_all_layers\crithab_poly.shp"
+results_dir = r"C:\Users\souvi\OneDrive\Documents\aria\AIparts\results"
+os.makedirs(results_dir, exist_ok=True)
+
+H = W = 128
+
+
+TARGET_TILES = 2000
+MAX_ATTEMPTS = 80000
+LOG_EVERY    = 250
+
+
+TAU_H = 0.10
+
+
+QUOTAS_INIT = {
+    "habitat_heavy": 500,
+    "high_kwa":      500,
+    "cultivated":    500,
+    "background":    500,
+}
+
+
+HF_HEAVY = 0.10
+KWA_HIGH = 0.20
+CULT_MIN = 0.10
+
+
+BLOCK = 512 
+
+
+LR = 1e-3
+BATCH = 64
+EPOCHS = 50
+WEIGHT_DECAY = 1e-4
+PATIENCE = 8
+GRAD_CLIP = 1.0
+
+
+DO_SPATIAL_CV = True
+N_FOLDS = 5              
+INNER_VAL_SPLITS = 5     
+
+
+RUN_SINGLE_SPLIT_AFTER_CV = False
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+cache_path = os.path.join(results_dir, f"tiles_cache_{TARGET_TILES}_H{H}_W{W}_B{BLOCK}.npz")
+
+USE_CACHE = False
+
+if os.path.exists(cache_path):
+    print("Loading cached dataset:", cache_path)
+    data = np.load(cache_path)
+
+
+    X_data = data["X_data"]
+    scores = data["scores"]
+    hab_fracs = data["hab_fracs"]
+    rows_kept = data["rows_kept"]
+    cols_kept = data["cols_kept"]
+
+    USE_CACHE = True
+    print("Loaded cached tiles:", X_data.shape)
+
+
+print("Loading habitat polygons...")
+gdf = gpd.read_file(hab_shp)
+
+print("Opening KWA to get CRS...")
+with rasterio.open(kwa_path) as kwa_src:
+    kwa_crs = kwa_src.crs
+
+if gdf.crs != kwa_crs:
+    print("Reprojecting habitat polygons to KWA CRS...")
+    gdf = gdf.to_crs(kwa_crs)
+
+print("Building spatial index...")
+sidx = gdf.sindex
+print("Spatial index ready.")
+
+print("Estimating KWA max value (small downsample read)...")
+with rasterio.open(kwa_path) as kwa_src:
+    sample = kwa_src.read(1, out_shape=(2048, 2048), resampling=Resampling.nearest).astype(np.float32)
+    if kwa_src.nodata is not None:
+        sample = np.where(sample == kwa_src.nodata, 0, sample)
+    kwa_max = float(sample.max())
+
+if kwa_max <= 0:
+    kwa_max = 1.0
+
+print("Estimated KWA max:", kwa_max)
+
+
+cache_path = os.path.join(results_dir, f"tiles_cache_{TARGET_TILES}_H{H}_W{W}_B{BLOCK}.npz")
+USE_CACHE = False
+
+if os.path.exists(cache_path):
+    print("Loading cached dataset:", cache_path)
+    data = np.load(cache_path)
+
+    X_data = data["X_data"]
+    scores = data["scores"]
+    hab_fracs = data["hab_fracs"]
+    rows_kept = data["rows_kept"]
+    cols_kept = data["cols_kept"]
+
+    USE_CACHE = True
+    print("Loaded cached tiles:", X_data.shape)
+
+
+if not USE_CACHE:
+    print("Building tiles...")
+    t0 = time.time()
+
+    X_list, scores_list, hab_fracs_list = [], [], []
+    rows_list, cols_list = [], []
+
+    quotas = dict(QUOTAS_INIT)
+    accepted_by_cat = {k: 0 for k in quotas.keys()}
+
+    attempts = 0
+    accepted = 0
+
+    with rasterio.open(kwa_path) as kwa_src, rasterio.open(cdls_path) as cdls_src:
+        height, width = kwa_src.height, kwa_src.width
+        print("KWA raster size:", (height, width))
+
+        while accepted < TARGET_TILES and attempts < MAX_ATTEMPTS:
+            attempts += 1
+
+            row = np.random.randint(0, height - H)
+            col = np.random.randint(0, width - W)
+            win = Window(col, row, W, H)
+
+            kwa_tile = kwa_src.read(1, window=win).astype(np.float32)
+            if kwa_src.nodata is not None:
+                kwa_tile = np.where(kwa_tile == kwa_src.nodata, 0, kwa_tile)
+            kwa_tile = (kwa_tile / kwa_max).astype(np.float32)
+
+            win_transform = rasterio.windows.transform(win, kwa_src.transform)
+            left, top = win_transform * (0, 0)
+            right, bottom = win_transform * (W, H)
+            tile_bounds = (min(left, right), min(bottom, top), max(left, right), max(bottom, top))
+
+
+            if cdls_src.crs != kwa_crs:
+                cdls_bounds = transform_bounds(kwa_crs, cdls_src.crs, *tile_bounds, densify_pts=21)
+            else:
+                cdls_bounds = tile_bounds
+
+            cdls_win = from_bounds(*cdls_bounds, transform=cdls_src.transform)
+            cdls_tile = cdls_src.read(
+                1,
+                window=cdls_win,
+                out_shape=(H, W),
+                resampling=Resampling.nearest
+            )
+            if cdls_src.nodata is not None:
+                cdls_tile = np.where(cdls_tile == cdls_src.nodata, 0, cdls_tile)
+
+            cultivated = (cdls_tile == 2).astype(np.float32)
+
+            hits = list(sidx.intersection(tile_bounds))
+            if len(hits) > 0:
+                sub = gdf.iloc[hits]
+                habitat = rasterize(
+                    shapes=((geom, 1) for geom in sub.geometry),
+                    out_shape=(H, W),
+                    transform=win_transform,
+                    fill=0,
+                    dtype="uint8"
+                ).astype(np.float32)
+            else:
+                habitat = np.zeros((H, W), dtype=np.float32)
+
+            if (
+                kwa_tile.mean() < 0.01 and
+                habitat.mean() == 0.0 and
+                cultivated.mean() == 0.0
+            ):
+                if attempts % LOG_EVERY == 0:
+                    rate = accepted / max(1, attempts)
+                    print(f"  attempts={attempts} accepted={accepted} acceptance_rate={rate:.3f} (skipping empties)")
+                continue
+
+            hf = float(habitat.mean())
+            cf = float(cultivated.mean())
+            km = float(kwa_tile.mean())
+
+            if hf > HF_HEAVY:
+                cat = "habitat_heavy"
+            elif km > KWA_HIGH:
+                cat = "high_kwa"
+            elif cf > CULT_MIN:
+                cat = "cultivated"
+            else:
+                cat = "background"
+
+            if cat not in quotas or quotas[cat] <= 0:
+                if attempts % LOG_EVERY == 0:
+                    rate = accepted / max(1, attempts)
+                    print(f"  attempts={attempts} accepted={accepted} acceptance_rate={rate:.3f} (quota filled for {cat})")
+                continue
+
+    
+            X = np.stack([habitat, cultivated, kwa_tile], axis=0).astype(np.float32)
+            X_list.append(X)
+
+            hab_fracs_list.append(hf)
+
+            score = 1.0 - (0.6 * km + 0.3 * hf - 0.1 * cf)
+            scores_list.append(score)
+
+            rows_list.append(row)
+            cols_list.append(col)
+
+            quotas[cat] -= 1
+            accepted_by_cat[cat] += 1
+            accepted += 1
+
+            if accepted % LOG_EVERY == 0:
+                rate = accepted / max(1, attempts)
+                print(f"  accepted={accepted}/{TARGET_TILES} | attempts={attempts} | acceptance_rate={rate:.3f} | last_cat={cat} | last_hits={len(hits)}")
+
+    t1 = time.time()
+    print(f"Done building tiles in {t1 - t0:.1f}s")
+    print(f"Final acceptance rate = {accepted}/{attempts} = {accepted/max(1,attempts):.3f}")
+    print("Accepted by category:", accepted_by_cat)
+
+    if accepted < TARGET_TILES:
+        raise RuntimeError(
+            f"Only accepted {accepted} tiles before MAX_ATTEMPTS ({MAX_ATTEMPTS}). "
+            "Try increasing MAX_ATTEMPTS or loosening thresholds/quotas."
+        )
+
+
+    X_data = np.stack(X_list, axis=0).astype(np.float32)
+    scores = np.array(scores_list, dtype=np.float32)
+    hab_fracs = np.array(hab_fracs_list, dtype=np.float32)
+    rows_kept = np.array(rows_list, dtype=np.int32)
+    cols_kept = np.array(cols_list, dtype=np.int32)
+
+    print("X_data:", X_data.shape, X_data.dtype)
+    print("scores min/max:", float(scores.min()), float(scores.max()))
+    print("hab_fracs min/max:", float(hab_fracs.min()), float(hab_fracs.max()))
+
+    np.savez_compressed(
+        cache_path,
+        X_data=X_data,
+        scores=scores,
+        hab_fracs=hab_fracs,
+        rows_kept=rows_kept,
+        cols_kept=cols_kept,
+    )
+    print("Saved dataset cache:", cache_path)
+
+
+def make_labels_from_scores(scores, hab_fracs, tau_h):
+    q1, q2 = np.quantile(scores, [1/3, 2/3])
+
+    y = np.zeros(len(scores), dtype=np.int64)          # 0=Low
+    y[(scores > q1) & (scores < q2)] = 1               # 1=Med
+    y[scores >= q2] = 2                                # 2=High
+
+    y[hab_fracs > tau_h] = 0
+
+    return y, q1, q2
+
+
+
+y, q1, q2 = make_labels_from_scores(scores, hab_fracs, TAU_H)
+
+print("Quantiles:", float(q1), float(q2))
+print("Forced Low count (habitat rule):", int((hab_fracs > TAU_H).sum()))
+print("Label counts Low/Med/High:", np.bincount(y, minlength=3))
+
+
+
+# Channel 0 = habitat, Channel 1 = cultivated, Channel 2 = KWA
+hab_means = X_data[:, 0, :, :].mean(axis=(1, 2))
+cult_means = X_data[:, 1, :, :].mean(axis=(1, 2))
+kwa_means = X_data[:, 2, :, :].mean(axis=(1, 2))
+
+
+weight_configs = {
+    "original_0.6_0.3_-0.1": (0.6, 0.3, -0.1),
+    "more_habitat_0.5_0.4_-0.1": (0.5, 0.4, -0.1),
+    "more_kwa_0.7_0.2_-0.1": (0.7, 0.2, -0.1),
+    "more_cultivated_0.6_0.3_-0.2": (0.6, 0.3, -0.2),
+    "less_cultivated_0.6_0.3_-0.05": (0.6, 0.3, -0.05),
+}
+
+
+
+y_original = y.copy()
+
+for name, (w_kwa, w_hab, w_cult) in weight_configs.items():
+
+    alt_scores = 1.0 - (
+        w_kwa * kwa_means +
+        w_hab * hab_means +
+        w_cult * cult_means
+    )
+
+    y_alt, alt_q1, alt_q2 = make_labels_from_scores(
+        alt_scores,
+        hab_fracs,
+        TAU_H
+    )
+
+    changed_count = int(np.sum(y_alt != y_original))
+    changed_percent = 100 * changed_count / len(y_original)
+
+    print(f"\n{name}")
+    print(f"  weights: KWA={w_kwa}, habitat={w_hab}, cultivated={w_cult}")
+    print(f"  quantiles: q1={alt_q1:.4f}, q2={alt_q2:.4f}")
+    print(f"  label counts Low/Med/High: {np.bincount(y_alt, minlength=3)}")
+    print(f"  changed labels vs original: {changed_count}/{len(y_original)} = {changed_percent:.2f}%")
+
+
+
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    balanced_accuracy_score,
+    classification_report
+)
+
+
+
+hab_mean = X_data[:, 0].mean(axis=(1, 2))
+cult_mean = X_data[:, 1].mean(axis=(1, 2))
+kwa_mean = X_data[:, 2].mean(axis=(1, 2))
+
+
+heuristic_scores = 1.0 - (
+    0.6 * kwa_mean +
+    0.3 * hab_mean -
+    0.1 * cult_mean
+)
+
+
+hq1, hq2 = np.quantile(heuristic_scores, [1/3, 2/3])
+
+y_heuristic = np.zeros(len(heuristic_scores), dtype=np.int64)
+y_heuristic[(heuristic_scores > hq1) & (heuristic_scores < hq2)] = 1
+y_heuristic[heuristic_scores >= hq2] = 2
+
+y_heuristic[hab_mean > TAU_H] = 0
+
+print("\n==============================")
+print("ZERO-PARAMETER HEURISTIC BASELINE")
+print("==============================")
+
+print("Accuracy:",
+      accuracy_score(y, y_heuristic))
+
+print("Macro F1:",
+      f1_score(y, y_heuristic, average="macro"))
+
+print("Balanced Accuracy:",
+      balanced_accuracy_score(y, y_heuristic))
+
+print(classification_report(
+    y,
+    y_heuristic,
+    labels=[0,1,2],
+    target_names=["Low","Med","High"],
+    zero_division=0
+))
+
+
+
+
+
+
+
+class_names = ["Low", "Medium", "High"]
+channel_names = ["Critical Habitat", "Cultivated Land", "KWA"]
+
+def pick_visible_tile(class_id):
+    idxs = np.where(y == class_id)[0]
+
+   
+    habitat_mean = X_data[idxs, 0].mean(axis=(1, 2))
+    cultivated_mean = X_data[idxs, 1].mean(axis=(1, 2))
+    kwa_mean = X_data[idxs, 2].mean(axis=(1, 2))
+
+   
+    if class_id == 0:
+        
+        score = habitat_mean + kwa_mean
+
+    elif class_id == 1:
+       
+        score = habitat_mean + cultivated_mean + kwa_mean
+
+    else:
+       
+        score = cultivated_mean - habitat_mean - kwa_mean
+
+    best_local = np.argmax(score)
+    return idxs[best_local]
+
+
+example_indices = [pick_visible_tile(0), pick_visible_tile(1), pick_visible_tile(2)]
+
+fig, axes = plt.subplots(3, 3, figsize=(9, 9))
+
+for row, idx in enumerate(example_indices):
+    for ch in [0, 1, 2]:
+        ax = axes[row, ch]
+        ax.imshow(X_data[idx, ch], interpolation="nearest")
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        if row == 0:
+            ax.set_title(channel_names[ch])
+
+        if ch == 0:
+            ax.set_ylabel(class_names[row], rotation=90, fontsize=12)
+
+plt.suptitle("Representative Input Tiles by Suitability Class", fontsize=14)
+plt.tight_layout()
+
+example_tile_path = os.path.join(results_dir, "representative_tiles_by_class.png")
+plt.savefig(example_tile_path, dpi=200)
+plt.show()
+
+print("Saved example tile figure:", example_tile_path)
+print("Example indices:", example_indices)
+
+
+
+
+
+
+groups = (rows_kept // BLOCK).astype(np.int64) * 10_000 + (cols_kept // BLOCK).astype(np.int64)
+
+class SuitabilityCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c1a = nn.Conv2d(3, 32, 3, padding=1)
+        self.c1b = nn.Conv2d(32, 32, 3, padding=1)
+
+        self.c2a = nn.Conv2d(32, 64, 3, padding=1)
+        self.c2b = nn.Conv2d(64, 64, 3, padding=1)
+
+        self.c3a = nn.Conv2d(64, 128, 3, padding=1)
+        self.c3b = nn.Conv2d(128, 128, 3, padding=1)
+
+        self.pool = nn.MaxPool2d(2, 2)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc1 = nn.Linear(128, 64)
+        self.drop = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(64, 3)
+
+    def forward(self, x):
+        x = F.relu(self.c1a(x))
+        x = F.relu(self.c1b(x))
+        x = self.pool(x)
+
+        x = F.relu(self.c2a(x))
+        x = F.relu(self.c2b(x))
+        x = self.pool(x)
+
+        x = F.relu(self.c3a(x))
+        x = F.relu(self.c3b(x))
+        x = self.pool(x)
+
+        x = self.gap(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.drop(x)
+        return self.fc2(x)  
+        
+model = SuitabilityCNN()
+
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+print("Total params:", total_params)
+print("Trainable params:", trainable_params)
+
+
+
+
+
+
+def make_loaders(X_tr, y_tr, X_val, y_val, X_te, y_te, batch=BATCH):
+    train_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+    val_ds   = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
+    test_ds  = TensorDataset(torch.from_numpy(X_te), torch.from_numpy(y_te))
+
+    train_loader = DataLoader(train_ds, batch_size=batch, shuffle=True)
+    train_eval_loader = DataLoader(train_ds, batch_size=batch, shuffle=False)  
+    val_loader  = DataLoader(val_ds, batch_size=batch, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=batch, shuffle=False)
+    return train_loader, train_eval_loader, val_loader, test_loader
+
+def train_one_fold(X_tr, y_tr, X_val, y_val, fold_dir):
+    os.makedirs(fold_dir, exist_ok=True)
+
+    train_loader, train_eval_loader, val_loader, _ = make_loaders(
+        X_tr, y_tr, X_val, y_val, X_val[:1], y_val[:1]  
+    )
+
+    model = SuitabilityCNN().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3
+    )
+
+    def eval_loader(loader):
+        model.eval()
+        tot_loss, correct, total = 0.0, 0, 0
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                tot_loss += loss.item() * xb.size(0)
+                pred = logits.argmax(dim=1)
+                correct += (pred == yb).sum().item()
+                total += yb.numel()
+        return tot_loss / max(1, total), correct / max(1, total)
+
+    best_val = float("inf")
+    bad_epochs = 0
+    best_path = os.path.join(fold_dir, "best_by_val_loss.pt")
+
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+
+    for ep in range(1, EPOCHS + 1):
+        model.train()
+        running = 0.0
+
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            if GRAD_CLIP is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            running += loss.item() * xb.size(0)
+
+        train_loss = running / len(train_loader.dataset)
+        val_loss, val_acc = eval_loader(val_loader)
+        _, train_acc = eval_loader(train_eval_loader)
+
+        scheduler.step(val_loss)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(
+            f"  Epoch {ep:02d}/{EPOCHS} | lr {lr_now:.2e} | "
+            f"train loss {train_loss:.4f} acc {train_acc:.3f} | "
+            f"val loss {val_loss:.4f} acc {val_acc:.3f}"
+        )
+
+        if val_loss < best_val - 1e-4:
+            best_val = val_loss
+            bad_epochs = 0
+            torch.save(model.state_dict(), best_path)
+        else:
+            bad_epochs += 1
+            if bad_epochs >= PATIENCE:
+                print(f"  Early stopping (best val loss {best_val:.4f})")
+                break
+
+   
+    np.save(os.path.join(fold_dir, "train_losses.npy"), np.array(train_losses))
+    np.save(os.path.join(fold_dir, "val_losses.npy"), np.array(val_losses))
+    np.save(os.path.join(fold_dir, "train_accs.npy"), np.array(train_accs))
+    np.save(os.path.join(fold_dir, "val_accs.npy"), np.array(val_accs))
+    import matplotlib.pyplot as plt
+
+    plt.figure()
+    plt.plot(train_losses, label="train")
+    plt.plot(val_losses, label="val")
+    plt.title("Loss Curves")
+    plt.xlabel("Epoch")
+    plt.ylabel("Cross-Entropy Loss")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    plt.plot(train_accs, label="train")
+    plt.plot(val_accs, label="val")
+    plt.title("Accuracy Curves")
+    plt.xlabel("Epoch")
+    plt.ylabel("Classification Accuracy")
+    plt.legend()
+    plt.show()
+    return best_path
+
+def predict_loader(model, loader):
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            logits = model(xb)
+            p = logits.argmax(dim=1).cpu().numpy()
+            preds.append(p)
+            trues.append(yb.numpy())
+    return np.concatenate(trues), np.concatenate(preds)
+
+def compute_metrics(y_true, y_pred):
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average="macro")
+    macro_precision = precision_score(y_true, y_pred, average="macro")
+    bal_acc  = balanced_accuracy_score(y_true, y_pred)
+    recalls  = recall_score(y_true, y_pred, average=None, labels=[0,1,2])
+    precisions = precision_score(y_true, y_pred, average=None, labels=[0,1,2])
+    return {
+        "accuracy": float(acc),
+        "macro_f1": float(macro_f1),
+        "macro_precision": float(macro_precision),
+        "balanced_accuracy": float(bal_acc),
+        "recall_low": float(recalls[0]),
+        "recall_med": float(recalls[1]),
+        "recall_high": float(recalls[2]),
+        "precision_low": float(precisions[0]),
+        "precision_med": float(precisions[1]),
+        "precision_high": float(precisions[2]),
+    }
+
+
+
+
+
+def nearest_train_test_distance(rows_kept, cols_kept, train_idx, test_idx, pixel_size_m=30.0):
+    train_rows = rows_kept[train_idx].astype(np.float64)
+    train_cols = cols_kept[train_idx].astype(np.float64)
+
+    test_rows = rows_kept[test_idx].astype(np.float64)
+    test_cols = cols_kept[test_idx].astype(np.float64)
+
+    nearest_dist_pixels = []
+
+    for rr, cc in zip(test_rows, test_cols):
+        d = np.sqrt((train_rows - rr) ** 2 + (train_cols - cc) ** 2)
+        nearest_dist_pixels.append(np.min(d))
+
+    nearest_dist_pixels = np.array(nearest_dist_pixels, dtype=np.float64)
+    nearest_dist_km = nearest_dist_pixels * pixel_size_m / 1000.0
+
+    return {
+        "min_km": float(np.min(nearest_dist_km)),
+        "mean_km": float(np.mean(nearest_dist_km)),
+        "median_km": float(np.median(nearest_dist_km)),
+        "max_km": float(np.max(nearest_dist_km)),
+    }
+
+
+def morans_i_on_errors(rows, cols, y_true, y_pred, k=8):
+    
+
+    coords = np.column_stack([cols, rows]).astype(float)
+    residual_error = (y_true != y_pred).astype(float)
+
+
+    if np.all(residual_error == residual_error[0]):
+        return {
+            "moran_I": np.nan,
+            "moran_p": np.nan,
+            "note": "Residuals constant; Moran's I undefined."
+        }
+
+   
+    k_use = min(k, len(coords) - 1)
+
+    w = KNN.from_array(coords, k=k_use)
+    w.transform = "r"
+
+    mi = Moran(residual_error, w)
+
+    return {
+        "moran_I": float(mi.I),
+        "moran_p": float(mi.p_sim),
+        "note": "Computed on binary prediction errors."
+    }
+
+
+
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    balanced_accuracy_score
+)
+
+def shuffle_channel_within_tiles(X, channel, seed=42):
+   
+
+    rng = np.random.default_rng(seed)
+
+    X_shuf = X.copy()
+
+    for i in range(X_shuf.shape[0]):
+
+        flat = X_shuf[i, channel].reshape(-1)
+
+        rng.shuffle(flat)
+
+        X_shuf[i, channel] = flat.reshape(
+            X_shuf.shape[2],
+            X_shuf.shape[3]
+        )
+
+    return X_shuf
+
+
+def evaluate_cnn_on_array(
+    model,
+    X_eval,
+    y_eval,
+    device,
+    batch_size=64
+):
+
+    ds = TensorDataset(
+        torch.from_numpy(X_eval.astype(np.float32)),
+        torch.from_numpy(y_eval)
+    )
+
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    model.eval()
+
+    preds = []
+    trues = []
+
+    with torch.no_grad():
+
+        for xb, yb in loader:
+
+            xb = xb.to(device)
+
+            logits = model(xb)
+
+            p = logits.argmax(dim=1).cpu().numpy()
+
+            preds.append(p)
+
+            trues.append(yb.numpy())
+
+    preds = np.concatenate(preds)
+    trues = np.concatenate(trues)
+
+    return {
+        "accuracy": accuracy_score(trues, preds),
+        "macro_f1": f1_score(
+            trues,
+            preds,
+            average="macro"
+        ),
+        "balanced_accuracy": balanced_accuracy_score(
+            trues,
+            preds
+        )
+    }
+
+
+
+if DO_SPATIAL_CV:
+    print("\n==============================")
+    print(f"SPATIAL CROSS-VALIDATION: {N_FOLDS} folds (outer), inner val splits={INNER_VAL_SPLITS}")
+    print("==============================\n")
+
+    outer = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+
+    fold_metrics = []
+    cm_sum = np.zeros((3, 3), dtype=np.int64)
+
+
+    fold_assignments = np.full(len(y), -1, dtype=np.int64)
+    fold_count_rows = []
+    spatial_diag_rows = []
+    
+    for fold_i, (trainval_idx, test_idx) in enumerate(outer.split(X_data, y, groups), start=1):
+        print(f"\n--- Fold {fold_i}/{N_FOLDS} ---")
+
+        fold_assignments[test_idx] = fold_i
+        
+        X_trainval, y_trainval = X_data[trainval_idx], y[trainval_idx]
+        g_trainval             = groups[trainval_idx]
+
+        X_test, y_test = X_data[test_idx], y[test_idx]
+
+
+
+        dist_stats = nearest_train_test_distance(
+            rows_kept=rows_kept,
+            cols_kept=cols_kept,
+            train_idx=trainval_idx,
+            test_idx=test_idx,
+            pixel_size_m=30.0
+        )
+
+        print("  Nearest train-test distance:")
+        print("    min km:   ", dist_stats["min_km"])
+        print("    mean km:  ", dist_stats["mean_km"])
+        print("    median km:", dist_stats["median_km"])
+        print("    max km:   ", dist_stats["max_km"])
+
+
+        inner = StratifiedGroupKFold(n_splits=INNER_VAL_SPLITS, shuffle=True, random_state=SEED + fold_i)
+        tr_idx_rel, val_idx_rel = next(inner.split(X_trainval, y_trainval, g_trainval))
+
+        X_tr, y_tr = X_trainval[tr_idx_rel], y_trainval[tr_idx_rel]
+        X_val, y_val = X_trainval[val_idx_rel], y_trainval[val_idx_rel]
+
+        print("  Sizes:", "train", X_tr.shape[0], "val", X_val.shape[0], "test", X_test.shape[0])
+        print("  Train counts:", np.bincount(y_tr, minlength=3))
+        print("  Val counts:  ", np.bincount(y_val, minlength=3))
+        print("  Test counts: ", np.bincount(y_test, minlength=3))
+
+        train_counts = np.bincount(y_tr, minlength=3)
+        val_counts = np.bincount(y_val, minlength=3)
+        test_counts = np.bincount(y_test, minlength=3)
+        
+        fold_count_rows.append({
+            "fold": fold_i,
+            "train_low": int(train_counts[0]),
+            "train_med": int(train_counts[1]),
+            "train_high": int(train_counts[2]),
+            "train_total": int(train_counts.sum()),
+            "val_low": int(val_counts[0]),
+            "val_med": int(val_counts[1]),
+            "val_high": int(val_counts[2]),
+            "val_total": int(val_counts.sum()),
+            "test_low": int(test_counts[0]),
+            "test_med": int(test_counts[1]),
+            "test_high": int(test_counts[2]),
+            "test_total": int(test_counts.sum()),
+        })
+
+
+
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score
+
+        def make_zonal_features(X):
+            hab = X[:, 0]
+            cult = X[:, 1]
+            kwa = X[:, 2]
+
+            features = np.column_stack([
+                hab.mean(axis=(1,2)),
+                cult.mean(axis=(1,2)),
+                kwa.mean(axis=(1,2)),
+                hab.std(axis=(1,2)),
+                cult.std(axis=(1,2)),
+                kwa.std(axis=(1,2)),
+                hab.max(axis=(1,2)),
+                cult.max(axis=(1,2)),
+                kwa.max(axis=(1,2)),
+            ])
+
+            return features
+
+        Xtr_feat = make_zonal_features(X_tr)
+        Xval_feat = make_zonal_features(X_val)
+        Xtest_feat = make_zonal_features(X_test)
+
+        rf = RandomForestClassifier(
+            n_estimators=200,
+            random_state=SEED,
+            class_weight="balanced"
+        )
+
+        rf.fit(Xtr_feat, y_tr)
+        rf_pred = rf.predict(Xtest_feat)
+
+        print("\nRandom Forest baseline on zonal statistics")
+        print("Accuracy:", accuracy_score(y_test, rf_pred))
+        print("Macro F1:", f1_score(y_test, rf_pred, average="macro"))
+        print("Balanced Accuracy:", balanced_accuracy_score(y_test, rf_pred))
+        print(classification_report(y_test, rf_pred, labels=[0,1,2], target_names=["Low","Med","High"], zero_division=0))
+
+        
+        class MeanFeatureMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = nn.Linear(3, 32)
+                self.fc2 = nn.Linear(32, 16)
+                self.fc3 = nn.Linear(16, 3)
+        
+            def forward(self, x):
+                x = F.relu(self.fc1(x))
+                x = F.relu(self.fc2(x))
+                return self.fc3(x)
+
+
+        def channel_means_tensor(X):
+            feats = np.column_stack([
+                X[:, 0].mean(axis=(1,2)),  # habitat fraction
+                X[:, 1].mean(axis=(1,2)),  # cultivated fraction
+                X[:, 2].mean(axis=(1,2)),  # KWA mean
+            ]).astype(np.float32)
+            return feats
+        
+        
+        Xtr_mean = channel_means_tensor(X_tr)
+        Xval_mean = channel_means_tensor(X_val)
+        Xtest_mean = channel_means_tensor(X_test)
+        
+        train_ds_mlp = TensorDataset(torch.from_numpy(Xtr_mean), torch.from_numpy(y_tr))
+        val_ds_mlp = TensorDataset(torch.from_numpy(Xval_mean), torch.from_numpy(y_val))
+        test_ds_mlp = TensorDataset(torch.from_numpy(Xtest_mean), torch.from_numpy(y_test))
+        
+        train_loader_mlp = DataLoader(train_ds_mlp, batch_size=64, shuffle=True)
+        test_loader_mlp = DataLoader(test_ds_mlp, batch_size=64, shuffle=False)
+        
+        mlp = MeanFeatureMLP().to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(mlp.parameters(), lr=1e-3, weight_decay=1e-4)
+        
+        for ep in range(20):
+            mlp.train()
+            for xb, yb in train_loader_mlp:
+                xb, yb = xb.to(device), yb.to(device)
+                optimizer.zero_grad()
+                logits = mlp(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+        
+        mlp.eval()
+        mlp_preds, mlp_true = [], []
+        
+        with torch.no_grad():
+            for xb, yb in test_loader_mlp:
+                xb = xb.to(device)
+                logits = mlp(xb)
+                preds = logits.argmax(dim=1).cpu().numpy()
+                mlp_preds.append(preds)
+                mlp_true.append(yb.numpy())
+        
+        mlp_preds = np.concatenate(mlp_preds)
+        mlp_true = np.concatenate(mlp_true)
+        
+        print("\nMLP baseline on channel means")
+        print("Accuracy:", accuracy_score(mlp_true, mlp_preds))
+        print("Macro F1:", f1_score(mlp_true, mlp_preds, average="macro"))
+        print("Balanced Accuracy:", balanced_accuracy_score(mlp_true, mlp_preds))
+        print(classification_report(mlp_true, mlp_preds, labels=[0,1,2], target_names=["Low","Med","High"], zero_division=0))
+
+
+
+
+        
+                
+        fold_dir = os.path.join(results_dir, f"spatial_cv_fold_{fold_i:02d}")
+        best_path = train_one_fold(X_tr, y_tr, X_val, y_val, fold_dir)
+
+        model = SuitabilityCNN().to(device)
+        model.load_state_dict(torch.load(best_path, map_location=device))
+
+        _, _, _, test_loader = make_loaders(X_tr, y_tr, X_val, y_val, X_test, y_test)
+        y_true, y_pred = predict_loader(model, test_loader)
+
+        m = compute_metrics(y_true, y_pred)
+
+        
+        moran_result = morans_i_on_errors(
+            rows=rows_kept[test_idx],
+            cols=cols_kept[test_idx],
+            y_true=y_true,
+            y_pred=y_pred,
+            k=8
+        )
+        
+        print("  Moran's I on test residuals:", moran_result)
+        
+        m["moran_I"] = moran_result["moran_I"]
+        m["moran_p"] = moran_result["moran_p"]
+        
+        fold_metrics.append(m)
+        
+        spatial_diag_rows.append({
+            "fold": fold_i,
+            "min_train_test_distance_km": dist_stats["min_km"],
+            "mean_train_test_distance_km": dist_stats["mean_km"],
+            "median_train_test_distance_km": dist_stats["median_km"],
+            "max_train_test_distance_km": dist_stats["max_km"],
+            "moran_I": moran_result["moran_I"],
+            "moran_p": moran_result["moran_p"],
+        })
+
+
+
+
+        
+        print("\n==============================")
+        print("CNN SPATIAL ABLATION TESTS")
+        print("==============================")
+        
+        normal_metrics = evaluate_cnn_on_array(
+            model,
+            X_test,
+            y_test,
+            device,
+            batch_size=BATCH
+        )
+        
+        print("\nNormal CNN")
+        print(normal_metrics)
+        
+
+        X_test_hab_shuffle = shuffle_channel_within_tiles(
+            X_test,
+            channel=0,
+            seed=SEED
+        )
+        
+        hab_shuffle_metrics = evaluate_cnn_on_array(
+            model,
+            X_test_hab_shuffle,
+            y_test,
+            device,
+            batch_size=BATCH
+        )
+        
+        print("\nHabitat channel shuffled")
+        print(hab_shuffle_metrics)
+        
+    
+        X_test_cult_shuffle = shuffle_channel_within_tiles(
+            X_test,
+            channel=1,
+            seed=SEED
+        )
+        
+        cult_shuffle_metrics = evaluate_cnn_on_array(
+            model,
+            X_test_cult_shuffle,
+            y_test,
+            device,
+            batch_size=BATCH
+        )
+        
+        print("\nCultivated channel shuffled")
+        print(cult_shuffle_metrics)
+        
+
+        X_test_kwa_shuffle = shuffle_channel_within_tiles(
+            X_test,
+            channel=2,
+            seed=SEED
+        )
+        
+        kwa_shuffle_metrics = evaluate_cnn_on_array(
+            model,
+            X_test_kwa_shuffle,
+            y_test,
+            device,
+            batch_size=BATCH
+        )
+        
+        print("\nKWA channel shuffled")
+        print(kwa_shuffle_metrics)
+
+
+
+
+
+
+
+        cm = confusion_matrix(y_true, y_pred, labels=[0,1,2])
+        cm_sum += cm
+
+        print("  Fold metrics:", m)
+        print("  Classification report:\n", classification_report(y_true, y_pred, target_names=["Low","Med","High"]))
+
+    def mean_std(key):
+        vals = np.array([fm[key] for fm in fold_metrics], dtype=np.float64)
+        return float(vals.mean()), float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+
+    print("\n==============================")
+    print("SPATIAL CV SUMMARY (mean ± std across folds)")
+    print("==============================")
+    for k in ["accuracy", "macro_f1", "macro_precision", "balanced_accuracy", "recall_low", "recall_med", "recall_high", "precision_low", "precision_med", "precision_high","moran_I"]:
+        mu, sd = mean_std(k)
+        print(f"{k:>18s}: {mu:.4f} ± {sd:.4f}")
+
+    disp = ConfusionMatrixDisplay(cm_sum, display_labels=["Low","Med","High"])
+    disp.plot()
+    plt.title(f"Summed Confusion Matrix across {N_FOLDS} Spatial Folds (counts)")
+    plt.show()
+
+    cm_norm = cm_sum.astype(np.float64)
+    row_sums = cm_norm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm_norm, np.maximum(row_sums, 1.0))
+    disp2 = ConfusionMatrixDisplay(cm_norm, display_labels=["Low","Med","High"])
+    disp2.plot(values_format=".2f")
+    plt.title(f"Summed Confusion Matrix across {N_FOLDS} Spatial Folds (row-normalized)")
+    plt.show()
+
+
+
+    
+    fold_counts_df = pd.DataFrame(fold_count_rows)
+    spatial_diag_df = pd.DataFrame(spatial_diag_rows)
+    
+    fold_counts_path = os.path.join(results_dir, "spatial_cv_fold_class_counts.csv")
+    spatial_diag_path = os.path.join(results_dir, "spatial_cv_leakage_diagnostics.csv")
+    
+    fold_counts_df.to_csv(fold_counts_path, index=False)
+    spatial_diag_df.to_csv(spatial_diag_path, index=False)
+    
+    print("\nSaved fold class counts:", fold_counts_path)
+    print("Saved spatial diagnostics:", spatial_diag_path)
+    
+    print("\nFold class counts:")
+    print(fold_counts_df)
+    
+    print("\nSpatial leakage diagnostics:")
+    print(spatial_diag_df)
+    
+    
+
+    plt.figure(figsize=(8, 6))
+    
+    scatter = plt.scatter(
+        cols_kept,
+        rows_kept,
+        c=fold_assignments,
+        s=10,
+        alpha=0.85
+    )
+    
+    plt.gca().invert_yaxis()
+    plt.colorbar(scatter, label="Outer spatial CV fold")
+    plt.xlabel("KWA raster column")
+    plt.ylabel("KWA raster row")
+    plt.title("Spatial Cross-Validation Fold Assignment")
+    plt.tight_layout()
+    
+    fold_map_path = os.path.join(results_dir, "spatial_cv_fold_assignment.png")
+    plt.savefig(fold_map_path, dpi=200)
+    plt.show()
+    
+    print("Saved fold assignment map:", fold_map_path)
+
+
+
+if RUN_SINGLE_SPLIT_AFTER_CV:
+    print("\n==============================")
+    print("SINGLE SPATIAL SPLIT (70/20/10 approx via grouped splits)")
+    print("==============================\n")
+
+
+    sgkf1 = StratifiedGroupKFold(n_splits=10, shuffle=True, random_state=SEED)
+    train_idx, temp_idx = next(sgkf1.split(X_data, y, groups))
+
+    X_train, y_train = X_data[train_idx], y[train_idx]
+    X_temp,  y_temp  = X_data[temp_idx],  y[temp_idx]
+    g_temp           = groups[temp_idx]
+
+    sgkf2 = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=SEED + 1)
+    val_rel_idx, test_rel_idx = next(sgkf2.split(X_temp, y_temp, g_temp))
+
+    X_val,  y_val  = X_temp[val_rel_idx],  y_temp[val_rel_idx]
+    X_test, y_test = X_temp[test_rel_idx], y_temp[test_rel_idx]
+
+    print("Train:", X_train.shape, "Val:", X_val.shape, "Test:", X_test.shape)
+
+    fold_dir = os.path.join(results_dir, "single_split_run")
+    best_path = train_one_fold(X_train, y_train, X_val, y_val, fold_dir)
+
+    model = SuitabilityCNN().to(device)
+    model.load_state_dict(torch.load(best_path, map_location=device))
+
+    _, _, _, test_loader = make_loaders(X_train, y_train, X_val, y_val, X_test, y_test)
+    y_true, y_pred = predict_loader(model, test_loader)
+
+    print("\n=== TEST METRICS (single split) ===")
+    m = compute_metrics(y_true, y_pred)
+    print(m)
+    print("\nClassification report:\n", classification_report(y_true, y_pred, target_names=["Low","Med","High"]))
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0,1,2])
+    ConfusionMatrixDisplay(cm, display_labels=["Low","Med","High"]).plot()
+    plt.title("Confusion Matrix (Test) - single split")
+    plt.show()
+
+    cm_norm = confusion_matrix(y_true, y_pred, labels=[0,1,2], normalize="true")
+    ConfusionMatrixDisplay(cm_norm, display_labels=["Low","Med","High"]).plot(values_format=".2f")
+    plt.title("Normalized Confusion Matrix (Test) - single split")
+    plt.show()
